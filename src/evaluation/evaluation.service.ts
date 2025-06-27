@@ -3,11 +3,13 @@ import {
   NotFoundException,
   BadRequestException,
   InternalServerErrorException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { CreateEvaluationDto } from './dto/create-evaluation.dto';
 import { UpdateEvaluationDto } from './dto/update-evaluation.dto';
+import { AvaliarSubordinadoDto } from './dto/evaluate_subordinate.dto';
 import { PrismaService } from '../../prisma/prisma.service';
-import { Evaluation } from '@prisma/client';
+import { Evaluation, EvaluationType } from '@prisma/client';
 
 @Injectable()
 export class EvaluationService {
@@ -15,6 +17,33 @@ export class EvaluationService {
 
   async criar(criarAvaliacaoDto: CreateEvaluationDto): Promise<Evaluation> {
     try {
+      // Primeiro, inferir o teamId do usuário avaliado
+      const avaliadoComEquipe = await this.prisma.user.findUnique({
+        where: { id: criarAvaliacaoDto.evaluatedId },
+        include: {
+          teamMemberships: {
+            include: {
+              team: true,
+            },
+          },
+        },
+      });
+
+      if (!avaliadoComEquipe) {
+        throw new BadRequestException('Usuário avaliado não encontrado');
+      }
+
+      if (
+        !avaliadoComEquipe.teamMemberships ||
+        avaliadoComEquipe.teamMemberships.length === 0
+      ) {
+        throw new BadRequestException(
+          'Usuário avaliado não pertence a nenhuma equipe',
+        );
+      }
+
+      const teamId = avaliadoComEquipe.teamMemberships[0].team.id;
+
       // Validar se todas as entidades referenciadas existem
       const [ciclo, avaliador, avaliado, equipe] = await Promise.all([
         this.prisma.evaluationCycle.findUnique({
@@ -28,7 +57,7 @@ export class EvaluationService {
           where: { id: criarAvaliacaoDto.evaluatedId },
         }),
         this.prisma.team.findUnique({
-          where: { id: criarAvaliacaoDto.teamId },
+          where: { id: teamId },
           include: { members: true },
         }),
       ]);
@@ -57,6 +86,18 @@ export class EvaluationService {
 
       await this.validateTeamMembership(criarAvaliacaoDto.evaluatedId, equipe);
 
+      // Para avaliações PAR, validar se avaliador e avaliado estão na mesma equipe
+      if (criarAvaliacaoDto.type === 'PAR') {
+        const avaliadorEquipe = await this.prisma.teamMember.findFirst({
+          where: { userId: criarAvaliacaoDto.evaluatorId, teamId: teamId },
+        });
+        if (!avaliadorEquipe) {
+          throw new BadRequestException(
+            'Para avaliações PAR, avaliador e avaliado devem estar na mesma equipe',
+          );
+        }
+      }
+
       // Verificar se já existe uma avaliação para esta combinação
       const avaliacaoExistente = await this.prisma.evaluation.findFirst({
         where: {
@@ -81,7 +122,7 @@ export class EvaluationService {
             cycleId: criarAvaliacaoDto.cycleId,
             evaluatorId: criarAvaliacaoDto.evaluatorId,
             evaluatedId: criarAvaliacaoDto.evaluatedId,
-            teamId: criarAvaliacaoDto.teamId,
+            teamId: teamId, // Usar o teamId inferido
             completed: criarAvaliacaoDto.completed ?? false,
           },
           include: {
@@ -683,7 +724,7 @@ export class EvaluationService {
             leaderScore: null,
             finalScore: null,
             feedback: 'Avaliação em andamento...',
-          },
+          } as any, // Temporário para contornar problema do Prisma Client
           include: {
             peerScores: true,
           },
@@ -850,5 +891,175 @@ export class EvaluationService {
     );
 
     return criteriosFaltantes.length === 0;
+  }
+
+  async buscarCriteriosParaAutoavaliacao(userId: string) {
+    // Buscar usuário com equipe e posição
+    const usuario = await this.prisma.user.findUnique({
+      where: { id: userId },
+      include: {
+        position: {
+          select: {
+            id: true,
+            name: true,
+            track: true,
+          },
+        },
+        teamMemberships: {
+          include: {
+            team: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!usuario) {
+      throw new NotFoundException('Usuário não encontrado');
+    }
+
+    if (!usuario.teamMemberships || usuario.teamMemberships.length === 0) {
+      throw new BadRequestException('Usuário não pertence a nenhuma equipe');
+    }
+
+    const equipe = usuario.teamMemberships[0].team;
+    const posicao = usuario.position;
+
+    // Buscar critérios atribuídos à equipe e posição do usuário
+    const criterios = await this.prisma.criteriaAssignment.findMany({
+      where: {
+        teamId: equipe.id,
+        positionId: posicao.id,
+      },
+      include: {
+        criterion: {
+          select: {
+            id: true,
+            title: true,
+            description: true,
+            type: true,
+          },
+        },
+      },
+    });
+
+    // Buscar ciclo atual (primeiro ciclo ativo)
+    const cicloAtual = await this.prisma.evaluationCycle.findFirst({
+      where: {
+        startDate: { lte: new Date() },
+        endDate: { gte: new Date() },
+      },
+      orderBy: { startDate: 'desc' },
+    });
+
+    if (!cicloAtual) {
+      throw new NotFoundException('Nenhum ciclo de avaliação ativo encontrado');
+    }
+
+    // Verificar se já existe autoavaliação para este usuário no ciclo atual
+    const autoavaliacaoExistente = await this.prisma.evaluation.findFirst({
+      where: {
+        evaluatorId: userId,
+        evaluatedId: userId,
+        cycleId: cicloAtual.id,
+        type: 'AUTO',
+      },
+      include: {
+        answers: {
+          include: {
+            criterion: {
+              select: {
+                id: true,
+                title: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    return {
+      user: {
+        id: usuario.id,
+        name: usuario.name,
+        position: posicao,
+      },
+      team: equipe,
+      criteria: criterios.map((c) => c.criterion),
+      currentCycle: {
+        id: cicloAtual.id,
+        name: cicloAtual.name,
+        startDate: cicloAtual.startDate,
+        endDate: cicloAtual.endDate,
+      },
+      existingEvaluation: autoavaliacaoExistente
+        ? {
+            id: autoavaliacaoExistente.id,
+            completed: autoavaliacaoExistente.completed,
+            answers: autoavaliacaoExistente.answers,
+            createdAt: autoavaliacaoExistente.createdAt,
+          }
+        : null,
+    };
+  }
+
+  async criarAvaliacaoGestor(
+    gestorId: string,
+    avaliacaoGestorDto: AvaliarSubordinadoDto,
+  ): Promise<Evaluation> {
+    // Verificar se o gestor realmente gerencia o subordinado
+    const subordinado = await this.prisma.user.findUnique({
+      where: { id: avaliacaoGestorDto.subordinadoId },
+      include: {
+        manager: true,
+        teamMemberships: {
+          include: {
+            team: true,
+          },
+        },
+      },
+    });
+
+    if (!subordinado) {
+      throw new NotFoundException('Subordinado não encontrado');
+    }
+
+    if (subordinado.managerId !== gestorId) {
+      throw new ForbiddenException(
+        'Você só pode avaliar seus subordinados diretos',
+      );
+    }
+
+    // Verificar se já existe avaliação do líder para este subordinado no ciclo
+    const avaliacaoExistente = await this.prisma.evaluation.findFirst({
+      where: {
+        evaluatorId: gestorId,
+        evaluatedId: avaliacaoGestorDto.subordinadoId,
+        cycleId: avaliacaoGestorDto.cycleId,
+        type: 'LIDER',
+      },
+    });
+
+    if (avaliacaoExistente) {
+      throw new BadRequestException(
+        'Já existe uma avaliação de líder para este subordinado neste ciclo',
+      );
+    }
+
+    // Usar a lógica existente de criação, forçando tipo LIDER
+    const criarAvaliacaoDto: CreateEvaluationDto = {
+      type: 'LIDER' as EvaluationType,
+      cycleId: avaliacaoGestorDto.cycleId,
+      evaluatorId: gestorId,
+      evaluatedId: avaliacaoGestorDto.subordinadoId,
+      completed: avaliacaoGestorDto.completed ?? true,
+      answers: avaliacaoGestorDto.answers,
+    };
+
+    return await this.criar(criarAvaliacaoDto);
   }
 }

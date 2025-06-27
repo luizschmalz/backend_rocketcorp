@@ -81,13 +81,6 @@ export class CreateEvaluationDto {
   evaluatedId: string;
 
   @ApiProperty({
-    description: 'ID da equipe',
-    example: 'team1',
-  })
-  @IsString({ message: 'ID da equipe deve ser uma string válida' })
-  @IsNotEmpty({ message: 'ID da equipe é obrigatório' })
-  teamId: string;
-  @ApiProperty({
     description: 'Se a avaliação está completa',
     example: false,
     required: false,
