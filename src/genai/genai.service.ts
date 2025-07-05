@@ -109,7 +109,7 @@ export class GenaiService {
           cycleId: cycleId,
           evaluatedId: evaluatedId,
           summary: insights.summary,
-          discrepancies: insights.discrepancies,
+          discrepancies: '', 
           brutalFacts: insights.brutalFacts,
         },
       });
@@ -168,7 +168,6 @@ export class GenaiService {
         evaluatedPosition: resumo.evaluated.position.name,
         evaluatedTrack: resumo.evaluated.position.track,
         summary: resumo.summary,
-        discrepancies: resumo.discrepancies,
         brutalFacts: resumo.brutalFacts,
         cycle: resumo.cycle,
       }));
@@ -445,16 +444,15 @@ INSTRUÇÕES PARA ANÁLISE:
 Gere uma análise completa no seguinte formato JSON:
 
 {
-  "summary": "Resumo executivo da performance (2-3 parágrafos). Inclua: contexto do colaborador, performance geral, principais forças identificadas, e áreas de melhoria específicas com base nos dados reais.",
-  "discrepancies": "Análise específica das discrepâncias entre autoavaliação vs pares vs líder. Identifique padrões, possíveis causas e recomendações para alinhamento. Se não houver discrepâncias significativas, destaque a consistência.",
-  "brutalFacts": "Pontos críticos e acionáveis baseados nos dados: 1) Principais gaps de performance, 2) Riscos para o colaborador/equipe, 3) Ações específicas recomendadas, 4) Prioridades de desenvolvimento."
+  "summary": "Resumo executivo da performance (3-4 parágrafos). Inclua: contexto do colaborador, performance geral, principais forças identificadas, áreas de melhoria específicas com base nos dados reais, e análise de consistência/variações entre autoavaliação, pares e líder.",
+  "brutalFacts": "Pontos críticos e acionáveis baseados nos dados: 1) Principais gaps de performance, 2) Riscos para o colaborador/equipe, 3) Ações específicas recomendadas, 4) Prioridades de desenvolvimento, 5) Recomendações para alinhamento de percepções se necessário."
 }
 
 DIRETRIZES CRÍTICAS:
 - Base-se EXCLUSIVAMENTE nos dados fornecidos
 - Seja específico com números e exemplos reais das avaliações
 - Identifique padrões nas justificativas fornecidas
-- Para discrepâncias: compare scores entre tipos de avaliação
+- Compare scores entre tipos de avaliação no resumo quando relevante
 - Para brutal facts: seja direto mas construtivo
 - Sugira ações específicas e mensuráveis
 - Mantenha tom profissional e respeitoso
@@ -468,8 +466,6 @@ DIRETRIZES CRÍTICAS:
         const parsed = JSON.parse(jsonMatch[0]);
         return {
           summary: parsed.summary || 'Resumo não gerado',
-          discrepancies:
-            parsed.discrepancies || 'Discrepâncias não identificadas',
           brutalFacts:
             parsed.brutalFacts || 'Pontos críticos não identificados',
         };
@@ -480,7 +476,6 @@ DIRETRIZES CRÍTICAS:
       console.error('Erro ao parsear resposta do Gemini:', error);
       return {
         summary: text.substring(0, 500) + '...',
-        discrepancies: 'Erro ao processar discrepâncias',
         brutalFacts: 'Erro ao processar pontos críticos',
       };
     }
@@ -490,8 +485,7 @@ DIRETRIZES CRÍTICAS:
     const sections = text.split('\n\n');
     return {
       summary: sections[0] || 'Resumo não disponível',
-      discrepancies: sections[1] || 'Discrepâncias não identificadas',
-      brutalFacts: sections[2] || 'Pontos críticos não identificados',
+      brutalFacts: sections[1] || 'Pontos críticos não identificados',
     };
   }
 
@@ -1036,12 +1030,10 @@ REGRAS CRÍTICAS:
     );
 
     const summary = this.gerarSummary(dadosEstruturados);
-    const discrepanciesText = this.gerarDiscrepancies(dadosEstruturados);
     const brutalFacts = this.gerarBrutalFacts(dadosEstruturados);
 
     return {
       summary,
-      discrepancies: discrepanciesText,
       brutalFacts,
     };
   }
@@ -1369,5 +1361,283 @@ REGRAS CRÍTICAS:
       min: Math.min(...allScores),
       max: Math.max(...allScores),
     };
+  }
+
+  async buscarInsightsDashboard(cycleId: string) {
+    try {
+      const resumos = await this.prisma.genaiInsight.findMany({
+        where: { cycleId: cycleId },
+        include: {
+          evaluated: {
+            select: {
+              id: true,
+              name: true,
+              email: true,
+              role: true,
+              position: {
+                select: {
+                  name: true,
+                  track: true,
+                },
+              },
+            },
+          },
+        },
+        orderBy: {
+          evaluated: {
+            name: 'asc',
+          },
+        },
+      });
+
+      // Buscar scores para complementar os dados do dashboard
+      const scoresPerCycle = await this.prisma.scorePerCycle.findMany({
+        where: { cycleId: cycleId },
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+            },
+          },
+        },
+      });
+
+      // Buscar status das avaliações
+      const evaluations = await this.prisma.evaluation.findMany({
+        where: { cycleId: cycleId },
+        select: {
+          evaluatedId: true,
+          completed: true,
+          type: true,
+        },
+      });
+
+      // Mapear dados para o dashboard
+      return resumos.map((resumo) => {
+        const userScores = scoresPerCycle.find(
+          (s) => s.userId === resumo.evaluatedId,
+        );
+        const userEvaluations = evaluations.filter(
+          (e) => e.evaluatedId === resumo.evaluatedId,
+        );
+        const completedEvaluations = userEvaluations.filter((e) => e.completed);
+
+        // Determinar status baseado nas avaliações
+        let status = 'pendente';
+        if (completedEvaluations.length > 0) {
+          const hasAuto = completedEvaluations.some((e) => e.type === 'AUTO');
+          const hasPeer = completedEvaluations.some((e) => e.type === 'PAR');
+          const hasLeader = completedEvaluations.some(
+            (e) => e.type === 'LIDER',
+          );
+
+          if (hasAuto && hasPeer && hasLeader) {
+            status = 'completo';
+          } else {
+            status = 'parcial';
+          }
+        }
+
+        return {
+          id: resumo.id,
+          evaluatedId: resumo.evaluatedId,
+          evaluatedName: resumo.evaluated.name,
+          position: resumo.evaluated.position.name,
+          summary: resumo.summary,
+          finalScore: userScores?.finalScore || null,
+          status: status,
+        };
+      });
+    } catch (error) {
+      throw new BadRequestException('Erro ao buscar insights do dashboard');
+    }
+  }
+
+  async buscarBrutalFacts(userId: string, cycleId: string) {
+    try {
+      const resumo = await this.prisma.genaiInsight.findFirst({
+        where: {
+          evaluatedId: userId,
+          cycleId: cycleId,
+        },
+        include: {
+          evaluated: {
+            select: {
+              name: true,
+              email: true,
+              role: true,
+              position: {
+                select: {
+                  name: true,
+                  track: true,
+                },
+              },
+            },
+          },
+          cycle: {
+            select: {
+              name: true,
+            },
+          },
+        },
+      });
+
+      if (!resumo) {
+        throw new NotFoundException(
+          'Insight não encontrado para este colaborador e ciclo',
+        );
+      }
+
+      // Retornar apenas os brutal facts com contexto
+      return {
+        id: resumo.id,
+        evaluatedId: resumo.evaluatedId,
+        evaluatedName: resumo.evaluated.name,
+        evaluatedPosition: resumo.evaluated.position.name,
+        cycleId: resumo.cycleId,
+        cycleName: resumo.cycle.name,
+        brutalFacts: resumo.brutalFacts,
+      };
+    } catch (error) {
+      if (error instanceof NotFoundException) {
+        throw error;
+      }
+      throw new BadRequestException(
+        'Erro ao buscar brutal facts do colaborador',
+      );
+    }
+  }
+
+  async buscarEvolucaoColaborador(userId: string) {
+    try {
+      // Buscar insights de todos os ciclos do colaborador
+      const insights = await this.prisma.genaiInsight.findMany({
+        where: {
+          evaluatedId: userId,
+        },
+        include: {
+          cycle: {
+            select: {
+              id: true,
+              name: true,
+              startDate: true,
+              endDate: true,
+            },
+          },
+          evaluated: {
+            select: {
+              name: true,
+              email: true,
+              role: true,
+              position: {
+                select: {
+                  name: true,
+                  track: true,
+                },
+              },
+            },
+          },
+        },
+        orderBy: {
+          cycle: {
+            startDate: 'asc',
+          },
+        },
+      });
+
+      if (insights.length === 0) {
+        throw new NotFoundException(
+          'Nenhum insight encontrado para este colaborador',
+        );
+      }
+
+      // Buscar scores históricos
+      const scoresHistoricos = await this.prisma.scorePerCycle.findMany({
+        where: {
+          userId: userId,
+        },
+        include: {
+          cycle: {
+            select: {
+              id: true,
+              name: true,
+              startDate: true,
+              endDate: true,
+            },
+          },
+        },
+        orderBy: {
+          cycle: {
+            startDate: 'asc',
+          },
+        },
+      });
+
+      // Calcular evolução dos scores
+      const evolucaoScores = scoresHistoricos.map((score, index) => {
+        const anterior = index > 0 ? scoresHistoricos[index - 1] : null;
+        const scoreAtual = score.finalScore || 0;
+        const scoreAnterior = anterior?.finalScore || 0;
+        const crescimento = anterior ? scoreAtual - scoreAnterior : 0;
+
+        return {
+          cycleId: score.cycleId,
+          cycleName: score.cycle.name,
+          startDate: score.cycle.startDate,
+          endDate: score.cycle.endDate,
+          finalScore: scoreAtual,
+          selfScore: score.selfScore,
+          leaderScore: score.leaderScore,
+          crescimento: crescimento,
+          crescimentoPercentual:
+            anterior && scoreAnterior > 0
+              ? ((crescimento / scoreAnterior) * 100).toFixed(1)
+              : '0.0',
+        };
+      });
+
+      // Mapear insights por ciclo
+      const evolucaoInsights = insights.map((insight) => ({
+        cycleId: insight.cycleId,
+        cycleName: insight.cycle.name,
+        startDate: insight.cycle.startDate,
+        endDate: insight.cycle.endDate,
+        summary: insight.summary,
+        brutalFacts: insight.brutalFacts,
+      }));
+
+      // Dados do colaborador
+      const colaborador = insights[0].evaluated;
+
+      return {
+        colaborador: {
+          id: userId,
+          name: colaborador.name,
+          email: colaborador.email,
+          role: colaborador.role,
+          position: colaborador.position.name,
+          track: colaborador.position.track,
+        },
+        totalCiclos: insights.length,
+        evolucaoScores: evolucaoScores,
+        evolucaoInsights: evolucaoInsights,
+        resumoEvolucao: {
+          scoreAtual:
+            evolucaoScores[evolucaoScores.length - 1]?.finalScore || null,
+          scoreInicial: evolucaoScores[0]?.finalScore || null,
+          crescimentoTotal:
+            evolucaoScores.length > 1
+              ? (evolucaoScores[evolucaoScores.length - 1]?.finalScore || 0) -
+                (evolucaoScores[0]?.finalScore || 0)
+              : 0,
+        },
+      };
+    } catch (error) {
+      if (error instanceof NotFoundException) {
+        throw error;
+      }
+      throw new BadRequestException('Erro ao buscar evolução do colaborador');
+    }
   }
 }
